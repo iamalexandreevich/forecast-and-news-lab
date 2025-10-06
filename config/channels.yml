@@ -1,0 +1,95 @@
+channels:
+  - username: investfuture
+    title: InvestFuture
+    enabled: true
+  - username: tbank_news
+    title: Tinkoff News
+    enabled: true
+
+  # Деловые СМИ / экономика и рынки
+  - username: rbc_news
+    title: РБК
+    enabled: true
+  - username: vedomosti
+    title: Ведомости
+    enabled: true
+  - username: kommersant
+    title: Коммерсантъ
+    enabled: true
+  - username: prime1
+    title: ПРАЙМ
+    enabled: true
+  - username: interfaxonline
+    title: Интерфакс
+    enabled: true
+  - username: World_Sanctions
+    title: "РИА Новости: экономика"
+    enabled: true
+  - username: vcnews
+    title: vc.ru (бизнес/технологии)
+    enabled: true
+
+  # Профильные финСМИ и площадки
+  - username: frank_media
+    title: Frank Media
+    enabled: true
+  - username: bankiruofficial
+    title: Банки.ру
+    enabled: true
+  - username: forbesrussia
+    title: Forbes Russia
+    enabled: true
+  - username: rbc_pro
+    title: В подписке на РБК (аналитика)
+    enabled: true
+
+  # Брокеры, биржа, инвестиции
+  - username: bcs_express
+    title: БКС Экспресс
+    enabled: true
+  - username: finamalert
+    title: Финам Торговые сигналы
+    enabled: true
+  - username: SberInvestments
+    title: СберИнвестиции
+    enabled: true
+  - username: alfa_investments
+    title: Альфа-Инвестиции
+    enabled: true
+  - username: MoscowExchangeOfficial
+    title: MOEX — Московская биржа
+    enabled: true
+  - username: selfinvestor
+    title: Сам ты инвестор! (РБК Инвестиции)
+    enabled: true
+
+  # Облигации (bond-каналы)
+  - username: cbonds
+    title: Cbonds.ru
+    enabled: true
+  - username: rusbondsnews
+    title: RUSBONDS.RU
+    enabled: true
+
+  # Инсайды банковского сектора
+  - username: banksta
+    title: Банкста
+    enabled: true
+  - username: FatCat18
+    title: Жирные коты
+    enabled: true
+
+  # Официальные органы и глобальные СМИ
+  - username: centralbank_russia
+    title: Банк России
+    enabled: true
+  - username: minfin
+    title: Минфин России
+    enabled: true
+  - username: bloomberg
+    title: Bloomberg (EN)
+    enabled: true
+
+  - username: economylive
+    title: "Больше, чем экономика"
+    enabled: true
