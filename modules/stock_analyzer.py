@@ -35,7 +35,21 @@ class StockAnalyzer:
                     successful_loads += 1
                     st.info(f"Данные для {symbol} получены через MOEX ISS API")
                 else:
-                    st.warning(f"Данные не найдены для {symbol}")
+                    # Попробуем автоматически добавить суффикс .ME для Yahoo Finance
+                    alt_symbol = symbol.upper()
+                    yahoo_alt = None
+                    if not alt_symbol.endswith(".ME"):
+                        yahoo_alt = self._fetch_from_yahoo(f"{alt_symbol}.ME", period)
+                        if yahoo_alt is not None and not yahoo_alt.empty:
+                            self.stock_data[symbol] = yahoo_alt
+                            successful_loads += 1
+                            st.info(f"Данные для {symbol} загружены как {alt_symbol}.ME (Yahoo Finance)")
+                            continue
+
+                    st.warning(
+                        f"Данные не найдены для {symbol}. "
+                        "Попробуйте указать тикер с суффиксом .ME или убедитесь, что актив торгуется на MOEX."
+                    )
             
             if successful_loads > 0:
                 return True

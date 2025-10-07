@@ -184,7 +184,11 @@ class Visualizer:
         fig = make_subplots(
             rows=2, cols=2,
             subplot_titles=('Sentiment Distribution', 'Sentiment Over Time', 
-                           'Impact Strength vs Confidence', 'Sentiment by Channel')
+                           'Impact Strength vs Confidence', 'Sentiment by Channel'),
+            specs=[
+                [{'type': 'domain'}, {'type': 'xy'}],
+                [{'type': 'xy'}, {'type': 'xy'}]
+            ]
         )
         
         # Sentiment distribution

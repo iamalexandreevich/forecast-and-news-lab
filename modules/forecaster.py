@@ -240,9 +240,18 @@ class StockForecaster:
                 last_price = current_data['Close'].iloc[-1]
                 predicted_price = last_price * (1 + predicted_return)
                 
-                # Create forecast entry
-                forecast_date = current_data.index[-1] + timedelta(days=1)
-                
+                # Determine forecast date from Date column (fallback to index)
+                if 'Date' in current_data.columns and not current_data['Date'].empty:
+                    last_date = pd.to_datetime(current_data['Date'].iloc[-1])
+                    forecast_date = last_date + timedelta(days=1)
+                else:
+                    last_index = current_data.index[-1]
+                    forecast_date = (
+                        last_index + 1
+                        if isinstance(last_index, (int, np.integer))
+                        else pd.to_datetime(last_index) + timedelta(days=1)
+                    )
+
                 forecast_entry = {
                     'Date': forecast_date,
                     'Predicted_Price': predicted_price,
@@ -252,14 +261,23 @@ class StockForecaster:
                 }
                 
                 forecasts.append(forecast_entry)
-                
+
                 # Update current_data for next iteration (simplified approach)
                 # In practice, you'd want more sophisticated feature updating
                 new_row = current_data.iloc[-1:].copy()
-                new_row.index = [forecast_date]
+                if 'Date' in new_row.columns:
+                    new_row['Date'] = forecast_date
+                if isinstance(forecast_date, (int, np.integer)):
+                    new_row.index = [forecast_date]
+                    append_kwargs = {}
+                else:
+                    append_kwargs = {'ignore_index': True} if not isinstance(new_row.index[0], (pd.Timestamp, datetime)) else {}
+                    if not append_kwargs:
+                        new_row.index = [forecast_date]
+
                 new_row['Close'] = predicted_price
-                current_data = pd.concat([current_data, new_row])
-                
+                current_data = pd.concat([current_data, new_row], **append_kwargs)
+
                 # Recalculate some features
                 current_data['SMA_5'] = current_data['Close'].rolling(window=5).mean()
                 current_data['SMA_20'] = current_data['Close'].rolling(window=20).mean()

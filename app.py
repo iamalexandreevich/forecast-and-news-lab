@@ -125,8 +125,8 @@ def main():
         news_days = st.slider(
             "Дни анализа новостей:",
             min_value=1,
-            max_value=30,
-            value=7
+            max_value=365,
+            value=30  # Увеличено с 7 до 30 по умолчанию
         )
         
         # API configuration inputs
@@ -251,11 +251,11 @@ def main():
                 if selected_stock in st.session_state.stock_analyzer.stock_data:
                     stock_data = st.session_state.stock_analyzer.stock_data[selected_stock]
                     fig_price = st.session_state.visualizer.plot_stock_price_history(stock_data, selected_stock)
-                    st.plotly_chart(fig_price, use_container_width=True)
+                    st.plotly_chart(fig_price, width='stretch')
                     
                     # Price distribution analysis
                     fig_dist = st.session_state.visualizer.plot_price_distribution(stock_data, selected_stock)
-                    st.plotly_chart(fig_dist, use_container_width=True)
+                    st.plotly_chart(fig_dist, width='stretch')
             
             with col2:
                 # Statistics table
@@ -271,7 +271,7 @@ def main():
             
             if top_rises is not None and top_falls is not None:
                 fig_movements = st.session_state.visualizer.plot_top_movements(top_rises, top_falls, selected_stock)
-                st.plotly_chart(fig_movements, use_container_width=True)
+                st.plotly_chart(fig_movements, width='stretch')
                 
                 # Display top movements tables
                 col1, col2 = st.columns(2)
@@ -341,6 +341,14 @@ def main():
             extra_keywords = [kw.strip() for kw in custom_keywords_input.replace('\n', ',').split(',') if kw.strip()]
             selected_keywords = sorted({*selected_keywords, *extra_keywords})
 
+        show_all_messages = st.checkbox(
+            "Показать все сообщения (без фильтров)",
+            value=False,
+            help="Отключить фильтрацию по тикерам и ключевым словам (полезно для диагностики)."
+        )
+        if show_all_messages:
+            st.caption("⚠️ Фильтрация отключена — будут загружены все сообщения за указанный период.")
+
         st.caption(f"📆 Инкрементальный сбор за последние {news_days} дн.")
 
         api_id = st.session_state.get('telegram_api_id')
@@ -397,22 +405,82 @@ def main():
                     st.write(f"- telegram_entered_code: {'установлен ✅' if st.session_state.get('telegram_entered_code') else 'не установлен ❌'}")
                     st.write(f"- telegram_auth_in_progress: {st.session_state.get('telegram_auth_in_progress', False)}")
 
+                # Расширенный лог событий с реальной детализацией
+                detailed_logs = st.expander("📊 Детальные логи сбора", expanded=True)
+                event_logs = []
+
+                def log_event(msg: str):
+                    """Добавляет событие в лог с временной меткой"""
+                    from datetime import datetime
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    log_msg = f"[{timestamp}] {msg}"
+                    event_logs.append(log_msg)
+                    # Выводим логи в реальном времени
+                    with detailed_logs:
+                        st.text(log_msg)
+
+                # Создаём callback для обновления прогресса
+                total_channels = len(combined_usernames)
+                completed_channels = 0
+                channel_stats = {}
+
+                def progress_callback(username: str, status_type: str, count: int, error_msg: str):
+                    nonlocal completed_channels
+
+                    if status_type == "start":
+                        log_event(f"🎯 @{username}: Начало обработки канала")
+                        log_event(f"📡 @{username}: Подключение к Telegram...")
+                        status.write(f"📥 @{username}: обработка...")
+                    elif status_type == "complete":
+                        completed_channels += 1
+                        channel_stats[username] = count
+                        log_event(f"✅ @{username}: ЗАВЕРШЕНО - собрано {count} сообщений")
+                        status.write(f"✅ @{username}: {count} сообщений")
+                        # Динамически обновляем прогресс-бар
+                        progress_pct = int((completed_channels / total_channels) * 70) + 20  # 20-90%
+                        progress_bar.progress(progress_pct, text=f"Обработано {completed_channels}/{total_channels} каналов")
+                    elif status_type == "waiting":
+                        log_event(f"⏰ @{username}: FloodWait - ожидание {count} сек...")
+                        status.write(f"⏰ @{username}: ожидание {count} сек...")
+                    elif status_type == "error":
+                        log_event(f"❌ @{username}: ОШИБКА - {error_msg}")
+                        status.write(f"❌ @{username}: {error_msg}")
+
+                parser_stock_symbols = stock_symbols if not show_all_messages else []
+                parser_keywords = selected_keywords if not show_all_messages else None
+
                 with st.status("Сбор сообщений из Telegram", expanded=True) as status:
-                    status.write(f"Каналы: {channels_text}")
+                    status.write(f"📋 Каналы для обработки: {channels_text}")
+                    status.write(f"📅 Период сбора: последние {news_days} дней")
+                    if show_all_messages:
+                        status.write("🎯 Фильтрация отключена — загружаем все сообщения")
+                    else:
+                        status.write(f"🎯 Тикеры для фильтрации: {', '.join(stock_symbols) if stock_symbols else 'все'}")
+                        if selected_keywords:
+                            status.write(f"🔍 Ключевые слова: {len(selected_keywords)} шт.")
                     progress_bar.progress(20, text="Инициализация клиента…")
                     try:
-                        status.write("🔄 Запуск парсера...")
+                        log_event("=" * 60)
+                        log_event("🚀 ЗАПУСК ПРОЦЕССА ПАРСИНГА")
+                        log_event("=" * 60)
+                        log_event(f"📊 Всего каналов к обработке: {len(combined_usernames)}")
+                        log_event(f"📅 Период сбора: {news_days} дней")
+                        status.write("🔄 Инициализация Telegram клиента...")
                         result_df = run_telegram_parser(
                             channel_list=selected_channel_payload,
-                            stock_symbols=stock_symbols,
+                            stock_symbols=parser_stock_symbols,
                             days_back=news_days,
                             api_id=api_id,
                             api_hash=api_hash,
                             phone=phone,
-                            keywords=selected_keywords or None,
+                            keywords=parser_keywords or None,
                             ui=st,
+                            progress_callback=progress_callback,
                         )
-                        progress_bar.progress(85, text="Обработка результатов…")
+                        progress_bar.progress(90, text="Обработка результатов…")
+                        log_event("=" * 60)
+                        log_event("📊 ОБРАБОТКА И ФИЛЬТРАЦИЯ РЕЗУЛЬТАТОВ")
+                        log_event("=" * 60)
                     except RuntimeError as exc:
                         # RuntimeError обычно означает "ожидание ввода кода"
                         if "Waiting for code input" in str(exc):
@@ -449,11 +517,38 @@ def main():
                             messages_df["channel"] = messages_df["channel_title"].fillna(messages_df["channel_username"])
                             messages_df["message_id"] = messages_df["id"]
                             st.session_state.telegram_messages = messages_df
+
+                            # Финальная статистика
+                            total_collected = sum(channel_stats.values())
+                            log_event("=" * 60)
+                            log_event("✅ ПАРСИНГ УСПЕШНО ЗАВЕРШЁН")
+                            log_event("=" * 60)
+                            log_event(f"📦 Всего собрано RAW: {total_collected} сообщений")
+                            log_event(f"🔍 После фильтрации: {len(messages_df)} сообщений")
+                            log_event(f"📊 Обработано каналов: {len(channel_stats)}")
+                            log_event("")
+                            log_event("📈 Статистика по каналам:")
+                            for ch_name, ch_count in sorted(channel_stats.items(), key=lambda x: x[1], reverse=True):
+                                log_event(f"  • @{ch_name}: {ch_count} сообщений")
+                            log_event("=" * 60)
+
                             status.update(label="Сбор завершён", state="complete")
-                            status.write(f"Получено {len(messages_df)} сообщений")
-                            st.success(f"Обработано {len(messages_df)} сообщений из {len(combined_usernames)} каналов")
+                            status.write(f"✅ Получено {len(messages_df)} сообщений после фильтрации")
+                            status.write(f"📊 Статистика по каналам:")
+                            for ch_name, ch_count in sorted(channel_stats.items(), key=lambda x: x[1], reverse=True):
+                                status.write(f"  • @{ch_name}: {ch_count} сообщений")
+
+                            st.success(f"✅ Обработано {len(messages_df)} сообщений из {len(combined_usernames)} каналов")
                         else:
                             st.session_state.telegram_messages = result_df
+                            log_event("=" * 60)
+                            log_event("⚠️ ПАРСИНГ ЗАВЕРШЁН - НЕТ РЕЗУЛЬТАТОВ")
+                            log_event("=" * 60)
+                            log_event("⚠️ Фильтры не обнаружили новых сообщений")
+                            log_event("💡 Попробуйте:")
+                            log_event("  - Увеличить период сбора (days_back)")
+                            log_event("  - Убрать или ослабить фильтры по тикерам")
+                            log_event("  - Добавить больше каналов")
                             status.update(label="Сбор завершён", state="complete")
                             status.write("Фильтры не обнаружили новых сообщений. Попробуйте ослабить условия.")
                             st.warning("Сообщения не найдены. Увеличьте окно поиска или уберите фильтры.")
@@ -473,7 +568,7 @@ def main():
                 if pd.notna(date_min) and pd.notna(date_max):
                     col3.metric("Диапазон дат", f"{date_min.strftime('%d.%m %H:%M')} – {date_max.strftime('%d.%m %H:%M')}")
             preview_cols = [col for col in ['date_utc', 'channel', 'text', 'tickers', 'links'] if col in news_df.columns]
-            st.dataframe(news_df[preview_cols].tail(25), use_container_width=True)
+            st.dataframe(news_df[preview_cols].tail(25), width='stretch')
 
         # Analyze sentiment if messages are available
         if news_available:
@@ -494,7 +589,7 @@ def main():
 
                 fig_sentiment = st.session_state.visualizer.plot_sentiment_analysis(sentiment_df)
                 if fig_sentiment:
-                    st.plotly_chart(fig_sentiment, use_container_width=True)
+                    st.plotly_chart(fig_sentiment, width='stretch')
 
                 st.subheader("Сводка настроений")
                 col1, col2, col3, col4 = st.columns(4)
@@ -560,7 +655,7 @@ def main():
             # Correlation visualization
             fig_correlation = st.session_state.visualizer.plot_correlation_analysis(correlation_df)
             if fig_correlation:
-                st.plotly_chart(fig_correlation, use_container_width=True)
+                st.plotly_chart(fig_correlation, width='stretch')
             
             # Correlation metrics
             st.subheader("Метрики корреляции")
@@ -658,7 +753,7 @@ def main():
             
                 # Forecast visualization
                 fig_forecast = st.session_state.visualizer.plot_forecast(historical_data, forecast_df, forecast_stock)
-                st.plotly_chart(fig_forecast, use_container_width=True)
+                st.plotly_chart(fig_forecast, width='stretch')
             
                 # Forecast summary
                 st.subheader("Forecast Summary")

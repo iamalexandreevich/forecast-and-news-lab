@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import re
+import sqlite3
 import yaml
 from io import BytesIO
 from datetime import datetime, timedelta, timezone
@@ -231,6 +232,17 @@ async def initialize_client(api_id: int, api_hash: str, phone: Optional[str], ui
     session_name = str(SESSION_NAME)
 
     LOGGER.info("[CLIENT] Создание клиента с session_name=%s", session_name)
+
+    # Configure SQLite to use WAL mode for better concurrency handling
+    # This prevents "database is locked" errors when fetching multiple channels
+    # Create a connection to configure the database before Telethon uses it
+    db_path = f"{session_name}.session"
+    conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.close()
+
     client = TelegramClient(session_name, api_id, api_hash)
     await client.connect()
     LOGGER.info("[CLIENT] Клиент подключен")
@@ -288,23 +300,66 @@ async def fetch_channel_messages(
     """Fetch recent messages for a single channel."""
 
     username = channel.normalized_username
-    entity = await client.get_entity(username)
+    LOGGER.info("[FETCH] 🔄 Начало сбора из @%s (since_id=%s, days_back=%d)", username, since_id, since_days)
+
+    try:
+        LOGGER.info("[FETCH] 📡 Подключение к каналу @%s...", username)
+        entity = await client.get_entity(username)
+        LOGGER.info("[FETCH] ✅ Канал @%s найден, начинаем чтение сообщений", username)
+    except Exception as exc:
+        LOGGER.error("[FETCH] ❌ Ошибка подключения к @%s: %s", username, exc)
+        raise
 
     min_id = since_id or 0
     cutoff = datetime.now(timezone.utc) - timedelta(days=since_days)
     collected: list[TelegramMessage] = []
 
-    async for msg in client.iter_messages(entity, min_id=min_id, reverse=True):
+    skipped_old = 0
+    skipped_empty = 0
+    skipped_already_seen = 0
+    message_counter = 0
+    first_msg_date = None
+    last_msg_date = None
+
+    LOGGER.info("[FETCH] 📖 Начало итерации по сообщениям @%s (min_id=%d, cutoff=%s)", username, min_id, cutoff.isoformat() if since_days else "не задан")
+
+    async for msg in client.iter_messages(entity, min_id=min_id):
+        message_counter += 1
+
+        # Логируем прогресс каждые 100 сообщений
+        if message_counter % 100 == 0:
+            LOGGER.info("[FETCH] 📊 @%s: обработано %d сообщений, собрано %d", username, message_counter, len(collected))
+
         if msg.id <= min_id:
+            skipped_already_seen += 1
+            # При движении от новых к старым можно завершить итерацию
+            if not since_days:
+                LOGGER.info("[FETCH] 🛑 @%s: достигнута граница уже обработанных сообщений (min_id=%d)", username, min_id)
+                break
             continue
 
         msg_date = getattr(msg, "date", None)
         if not msg_date:
+            skipped_empty += 1
             continue
 
         dt_utc = msg_date.astimezone(timezone.utc)
+
+        # Отслеживаем диапазон дат для диагностики
+        if first_msg_date is None:
+            first_msg_date = dt_utc
+        last_msg_date = dt_utc
+
         if since_days and dt_utc < cutoff:
-            continue
+            skipped_old += 1
+            # При движении от новых к старым можно остановиться — всё остальное ещё старше
+            LOGGER.info(
+                "[FETCH] 🛑 @%s: достигнут предел периода (%s < %s), завершаем загрузку",
+                username,
+                dt_utc.strftime("%Y-%m-%d %H:%M"),
+                cutoff.strftime("%Y-%m-%d %H:%M"),
+            )
+            break
 
         text = (getattr(msg, "message", None) or "").strip()
         raw_text = getattr(msg, "raw_text", None)
@@ -312,6 +367,7 @@ async def fetch_channel_messages(
             raw_text = raw_text.strip()
 
         if not text and not raw_text:
+            skipped_empty += 1
             continue
 
         base_text = text or raw_text or ""
@@ -337,6 +393,30 @@ async def fetch_channel_messages(
             msg_hash=make_msg_hash(username, dt_utc, base_text),
         )
         collected.append(message)
+
+    # Вывод диапазона дат для диагностики
+    if first_msg_date and last_msg_date:
+        LOGGER.info(
+            "[FETCH] 📅 @%s: Диапазон дат сообщений: %s → %s",
+            username, first_msg_date.strftime("%Y-%m-%d %H:%M"), last_msg_date.strftime("%Y-%m-%d %H:%M")
+        )
+
+    LOGGER.info(
+        "[FETCH] ✅ @%s: ЗАВЕРШЕНО - обработано всего %d сообщений, собрано %d (пропущено: старые=%d, пустые=%d, уже_обработаны=%d)",
+        username, message_counter, len(collected), skipped_old, skipped_empty, skipped_already_seen
+    )
+
+    # Дополнительная диагностика если собрано 0
+    if len(collected) == 0 and message_counter > 0:
+        LOGGER.warning(
+            "[FETCH] ⚠️ @%s: Не собрано ни одного сообщения! Проверьте фильтры: days_back=%d, cutoff=%s",
+            username, since_days, cutoff.isoformat()[:19] if since_days else "не задан"
+        )
+        if skipped_old > message_counter * 0.9:
+            LOGGER.warning(
+                "[FETCH] 💡 @%s: Большинство сообщений (%d из %d) старше %d дней. Попробуйте увеличить days_back",
+                username, skipped_old, message_counter, since_days
+            )
 
     return collected
 
@@ -419,27 +499,42 @@ def filter_messages(
     """Filter dataframe by tickers allow-list and/or keyword matches."""
 
     if df.empty:
+        LOGGER.info("[FILTER] Пустой DataFrame, фильтрация не требуется")
         return df
 
+    original_count = len(df)
     mask = pd.Series(False, index=df.index)
+
+    ticker_matched = 0
+    keyword_matched = 0
 
     if stock_symbols:
         allow = {symbol.strip().upper() for symbol in stock_symbols if symbol and symbol.strip()}
         if allow:
             ticker_mask = df["tickers"].apply(lambda items: bool(set(items) & allow))
+            ticker_matched = ticker_mask.sum()
             mask = mask | ticker_mask
+            LOGGER.info("[FILTER] По тикерам %s: найдено %d сообщений", list(allow), ticker_matched)
 
     if keywords:
         keywords_clean = [kw.strip() for kw in keywords if kw and kw.strip()]
         if keywords_clean:
             pattern = "|".join(re.escape(kw) for kw in keywords_clean)
             keyword_mask = df["text"].str.contains(pattern, case=False, na=False)
+            keyword_matched = keyword_mask.sum()
             mask = mask | keyword_mask
+            LOGGER.info("[FILTER] По ключевым словам (%d шт.): найдено %d сообщений", len(keywords_clean), keyword_matched)
 
     if not stock_symbols and not keywords:
+        LOGGER.info("[FILTER] Фильтры не заданы, возвращаем все %d сообщений", original_count)
         return df
 
-    return df[mask].copy()
+    filtered = df[mask].copy()
+    LOGGER.info(
+        "[FILTER] Итого: %d → %d сообщений (отфильтровано %d)",
+        original_count, len(filtered), original_count - len(filtered)
+    )
+    return filtered
 
 
 async def parse_channels(
@@ -452,8 +547,14 @@ async def parse_channels(
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     keywords: Optional[Sequence[str]] = None,
     ui=None,
+    progress_callback=None,
 ) -> pd.DataFrame:
-    """Fetch, normalize and filter messages for the provided channel configs."""
+    """Fetch, normalize and filter messages for the provided channel configs.
+
+    Args:
+        progress_callback: Optional callable(channel_username, status, count, error_msg)
+                          where status is one of: 'start', 'complete', 'error', 'waiting'
+    """
 
     _ensure_logger_configured()
 
@@ -462,12 +563,16 @@ async def parse_channels(
         LOGGER.info("No enabled channels supplied.")
         return pd.DataFrame(columns=TelegramMessage.model_fields.keys())
 
+    LOGGER.info("[PARSE] Начало обработки %d активных каналов", len(active_channels))
+
     api_id_int, api_hash_str, phone_value = _resolve_credentials(api_id, api_hash, phone)
 
     state = load_state(STATE_PATH)
     updated_state = state.copy()
 
+    LOGGER.info("[PARSE] Инициализация Telegram клиента...")
     client = await initialize_client(api_id_int, api_hash_str, phone_value, ui=ui)
+    LOGGER.info("[PARSE] Клиент готов, начинаем сбор сообщений")
 
     semaphore = asyncio.Semaphore(max_concurrency)
     results: list[list[TelegramMessage]] = []
@@ -480,56 +585,102 @@ async def parse_channels(
         last_id = state.get(username)
         attempt = 0
 
+        LOGGER.info("[PROCESS] 🎯 Начинаем обработку канала @%s", username)
+
+        # Notify start of processing
+        if progress_callback:
+            progress_callback(username, "start", 0, None)
+
         while True:
             try:
+                LOGGER.info("[PROCESS] 🔓 Получение семафора для @%s", username)
                 async with semaphore:
+                    LOGGER.info("[PROCESS] ✅ Семафор получен, запускаем fetch для @%s", username)
                     messages = await fetch_channel_messages(client, cfg, last_id, days_back)
+                    LOGGER.info("[PROCESS] 📦 Получено %d сообщений из @%s", len(messages), username)
                 break
             except FloodWaitError as exc:  # type: ignore[redundant-expr]
                 wait_seconds = getattr(exc, "seconds", 5) + random.uniform(0.5, 1.5)
-                LOGGER.warning("Flood wait for @%s: sleeping %.1f seconds", username, wait_seconds)
+                LOGGER.warning("[PROCESS] ⏰ Flood wait для @%s: ожидание %.1f секунд", username, wait_seconds)
+
+                # Notify waiting status
+                if progress_callback:
+                    progress_callback(username, "waiting", int(wait_seconds), None)
+
                 attempt += 1
                 if attempt >= FLOOD_RETRY_ATTEMPTS:
-                    LOGGER.error("Exceeded FloodWait retries for @%s", username)
+                    LOGGER.error("[PROCESS] ❌ Превышено число попыток FloodWait для @%s", username)
+                    if progress_callback:
+                        progress_callback(username, "error", 0, "Exceeded FloodWait retries")
                     return []
                 await asyncio.sleep(wait_seconds)
             except (ChannelPrivateError, UsernameInvalidError) as exc:
-                LOGGER.error("Skipped channel @%s: %s", username, exc)
+                error_msg = f"{type(exc).__name__}: {exc}"
+                LOGGER.error("[PROCESS] ❌ Пропущен канал @%s: %s", username, exc)
+                if progress_callback:
+                    progress_callback(username, "error", 0, error_msg)
                 return []
             except RPCError as exc:
-                LOGGER.error("RPC error for @%s: %s", username, exc)
+                error_msg = f"RPC error: {exc}"
+                LOGGER.error("[PROCESS] ❌ RPC ошибка для @%s: %s", username, exc)
+                if progress_callback:
+                    progress_callback(username, "error", 0, error_msg)
                 return []
             except Exception as exc:  # pylint: disable=broad-except
-                LOGGER.exception("Unexpected error while fetching @%s: %s", username, exc)
+                error_msg = f"{type(exc).__name__}: {exc}"
+                LOGGER.exception("[PROCESS] ❌ Неожиданная ошибка при обработке @%s: %s", username, exc)
+                if progress_callback:
+                    progress_callback(username, "error", 0, error_msg)
                 return []
 
         if messages:
             updated_state[username] = max(msg.id for msg in messages)
+            LOGGER.info("[PROCESS] 💾 Обновлен state для @%s: last_id=%d", username, updated_state[username])
 
+        # Notify completion
+        if progress_callback:
+            progress_callback(username, "complete", len(messages), None)
+
+        LOGGER.info("[PROCESS] ✅ Обработка канала @%s завершена: %d сообщений", username, len(messages))
         return messages
 
     try:
+        LOGGER.info("[PARSE] 🚀 Запуск параллельного сбора из %d каналов (max_concurrency=%d)", len(active_channels), max_concurrency)
         gather_results = await asyncio.gather(*(process_channel(cfg) for cfg in active_channels))
         results.extend(gather_results)
+        LOGGER.info("[PARSE] ✅ Все каналы обработаны, получено %d результатов", len(results))
     finally:
+        LOGGER.info("[PARSE] 🔌 Отключение клиента...")
         await client.disconnect()
+        LOGGER.info("[PARSE] ✅ Клиент отключен")
 
+    LOGGER.info("[PARSE] 📊 Объединение результатов...")
     all_messages: list[TelegramMessage] = [msg for channel_msgs in results for msg in channel_msgs]
     if not all_messages:
-        LOGGER.info("No messages collected from provided channels.")
+        LOGGER.warning("[PARSE] ⚠️ Не собрано ни одного сообщения из всех каналов")
         save_state(STATE_PATH, updated_state)
         return pd.DataFrame(columns=TelegramMessage.model_fields.keys())
 
+    LOGGER.info("[PARSE] 📦 Всего собрано %d сообщений из %d каналов", len(all_messages), len(active_channels))
+
+    LOGGER.info("[PARSE] 🔄 Создание DataFrame и удаление дубликатов...")
     raw_df = pd.DataFrame([msg.model_dump() for msg in all_messages])
     raw_df = raw_df.drop_duplicates(subset="msg_hash", keep="last")
+    LOGGER.info("[PARSE] ✅ После удаления дубликатов: %d сообщений", len(raw_df))
+
+    LOGGER.info("[PARSE] 📅 Преобразование дат и сортировка...")
     raw_df["date_utc"] = pd.to_datetime(raw_df["date_utc"], utc=True)
     raw_df.sort_values(["date_utc", "channel_username", "id"], inplace=True)
 
+    LOGGER.info("[PARSE] 💾 Сохранение state и результатов...")
     save_state(STATE_PATH, updated_state)
     _persist_results(raw_df)
+    LOGGER.info("[PARSE] ✅ Результаты сохранены в data/telegram/")
 
+    LOGGER.info("[PARSE] 🔍 Начинаем фильтрацию по тикерам и ключевым словам...")
     filtered = filter_messages(raw_df, stock_symbols=stock_symbols, keywords=keywords)
     filtered.reset_index(drop=True, inplace=True)
+    LOGGER.info("[PARSE] ✅ Парсинг завершён: %d сообщений готовы к анализу (из %d собранных)", len(filtered), len(raw_df))
     return filtered
 
 
@@ -568,6 +719,7 @@ def run_telegram_parser(
     keywords: Optional[Sequence[str]] = None,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     ui=None,
+    progress_callback=None,
 ) -> pd.DataFrame:
     """Synchronous wrapper returning a filtered DataFrame for Streamlit/CLI."""
 
@@ -583,6 +735,7 @@ def run_telegram_parser(
             max_concurrency=max_concurrency,
             keywords=keywords,
             ui=ui,
+            progress_callback=progress_callback,
         )
     )
 
